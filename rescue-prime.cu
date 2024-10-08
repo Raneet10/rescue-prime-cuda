@@ -2,9 +2,12 @@
 #include <cooperative_groups.h>
 
 #define TILE_WIDTH 32
+
+using namespace std;
 using namespace cooperative_groups;
 
-typedef long long int64_t finite_field;
+
+typedef __uint128_t finite_field;
 
 
 __global__ int64_t rescuePrime(int64_t *input_sequence, int64_t N, int64_t m, int64_t *mds, int64_t *round_constants, int64_t alpha, int64_t alphainv, int64_t rate) {
@@ -17,7 +20,7 @@ __global__ int64_t rescuePrime(int64_t *input_sequence, int64_t N, int64_t m, in
     int64_t absorbing_index = 0;
     while (absorbing_index < sizeof(input_sequence)) {
         for ( size_t i = idx; i < rate; i += stridex) {
-            state[i][0] += input_sequence[absorbing_index];
+            state[i] += input_sequence[absorbing_index];
             absorbing_index++;
         }
         state = rescuePrimePermutation(N, m, mds, round_constants, alpha, alphainv, state);
@@ -26,7 +29,7 @@ __global__ int64_t rescuePrime(int64_t *input_sequence, int64_t N, int64_t m, in
     int64_t *output_sequence;
     // squeezing phase
     for (size_t i = idx; i < rate; i += stridex) {
-        output_sequence[i] = state[i][0];
+        output_sequence[i] = state[i];
     }
     
     return output_sequence;
@@ -48,6 +51,35 @@ __device__ int64_t* matrix_mult(int64_t *a, int64_t *b, int64_t N) {
     return c;
 }
 
+__device__ finite_field exp_mod(finite_field b, finite_field e) {
+    finite_field result = 1;
+    while (e > 0) {
+        if (e & 1) {
+            result = mult128(result, b) % prime_field_mod;
+        }
+        e = e >> 1;
+        b = mult128(b,b) % prime_field_mod;
+    }
+
+    return result;
+}
+
+__device__ finite_field mul128(finite_field a, finite_field b) {
+    finite_field prod = 0;
+    uint64_t a_low = a & 0xFFFFFFFFFFFFFFFF;
+    uint64_t a_high = a >> 64;
+    uint64_t b_low = b & 0xFFFFFFFFFFFFFFFF;
+    uint64_t b_high = b >> 64;
+
+    finite_field z0 = a_low * b_low;
+    finite_field z1 = (a_low * b_high) << 64;
+    finite_field z2 =  (a_high * b_low) << 64;
+    finite_field z3 = (a_high * b_high) << 128;
+
+    prod = z0 + z1 + z2 + z3;
+    return prod;
+}
+
 __device__ void rescuePrimePermutation(int64_t N, int64_t m, int64_t *mds, int64_t *round_constants, int64_t alpha, int64_t alphainv, finite_field *state) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stridex = blockDim.x * gridDim.x;
@@ -57,34 +89,34 @@ __device__ void rescuePrimePermutation(int64_t N, int64_t m, int64_t *mds, int64
     for (size_t i = idx; i < N; i += stridex) {
         // S-box layer
         for (size_t j = idy; j < m; j += stridey) {
-            state[j][0] = state[j][0] ^ alpha;
+            state[j] =  exp_mod(state[j] , alpha);
         }
 
         __syncthreads();
 
         // MDS layer
-        state = matrix_mult(mds, state);
+        state = matrix_mult(mds, state, m);
 
         // Round constants
         for (size_t j = idy; j < m; j += stridey) {
-            state[j][0] += round_constants[i*2*m + j];
+            state[j] += round_constants[i*2*m + j];
         }
 
         __syncthreads();
 
         // inverse S-box layer
         for (size_t j = idy; j < m; j += stridey) {
-            state[j][0] = state[j][0] ^ alphainv;
+            state[j] = exp_mod(state[j] , alphainv);
         }
 
         __syncthreads();
 
         // MDS layer
-        state = matrix_mult(mds, state);
+        state = matrix_mult(mds, state, m);
 
         // Round constants
         for (size_t j = idy; j < m; j += stridey) {
-            state[j][0] += round_constants[i *2* m + m + j];
+            state[j] += round_constants[i *2* m + m + j];
         }
 
         __syncthreads();
@@ -97,16 +129,17 @@ __device__ void rescuePrimePermutation(int64_t N, int64_t m, int64_t *mds, int64
 int main() {
     // rescue prime constants
     size_t prime_field_mod = 407 * (1 << 119) + 1;
-    int64_t m = 2;
-    int64_t capacity = 1;
-    int64_t rate = 1;
-    int64_t N = 27;
-    int64_t alpha = 3;
+    uint64_t m = 2;
+    uint64_t capacity = 1;
+    uint64_t rate = 1;
+    uint64_t N = 27;
+    uint64_t alpha = 3;
+    uint64_t alphainv = 180331931428153586757283157844700080811
 
     const mds[4] = [270497897142230380135924736767050121214, 4, 
                     270497897142230380135924736767050121205, 13];
-    const inv_mds[4] = [210387253332845851216830350818816760948, 60110643809384528919094385948233360270, 
-                        90165965714076793378641578922350040407, 180331931428153586757283157844700080811];                    
+    // const inv_mds[4] = [210387253332845851216830350818816760948, 60110643809384528919094385948233360270, 
+    //                     90165965714076793378641578922350040407, 180331931428153586757283157844700080811];                    
     
     const round_constants[108] = [174420698556543096520990950387834928928,
                                         109797589356993153279775383318666383471,
@@ -216,10 +249,19 @@ int main() {
                                         144945344860351075586575129489570116296,
                                         261991152616933455169437121254310265934,
                                         18450316039330448878816627264054416127]
+
     
+    int64_t *cmds = nullptr, *cround_constants = nullptr
+    cudaMalloc(&cmds, sizeof(mds));
+    cudaMalloc(&cround_constants, sizeof(round_constants));
+    cudaMemcpy(cmds, mds, sizeof(mds), cudaMemcpyHostToDevice);
+    cudaMemcpy(cround_constants, round_constants, sizeof(round_constants), cudaMemcpyHostToDevice);
     dim3 gridDim(32*m*sizeof(finite_field), 32*m*sizeof(finite_field));
     dim3 blockDim(32, 32);
-    rescuePrime<<<gridDim, blockDim>>>(input_sequence, N, m, mds, round_constants, alpha, alphainv, rate);
+    rescuePrime<<<gridDim, blockDim>>>(input_sequence, N, m, cmds, cround_constants, alpha, alphainv, rate);
     cudaDeviceSynchronize();
+
+    cudaFree(cmds);
+    cudaFree(cround_constants);
     return 0;
 }
